@@ -1,6 +1,6 @@
 /*****************************************************************************
-* vidservice.c: Daemon that receives commands input devices and makes
-*               camera devices produce pictures into frame buffers.
+* vidservice.c: Daemon that receives commands from input devices and
+*               controls output to secondary frame buffers.
 *
 * Authors: Ivan Zaitsev
 *
@@ -44,11 +44,11 @@
 #define INPUT_DEVICE_NAME       "/dev/input/event1"
 #define CAMERA_EXT_DEVICE_NAME  "/dev/video0"
 #define CAMERA_INT_DEVICE_NAME  "/dev/video1"
-#define CAMERA_OUT_DEVICE_NAME  "/dev/graphics/fb0"
+#define CAMERA_OUT_DEVICE_NAME  "/dev/graphics/fb2"
 #define VIDEO_OUT_SWITCH_NAME   "/sys/class/video_output/LCD/state"
 
 #define HUD_OUT_DEVICE_NAME     "/dev/graphics/fb4"
-#define HUD_PICTURE_FILE_NAME   "/boot/hud/screen_1.bmp"
+#define HUD_PICTURE_FILE_NAME   "/boot/hud/screen_x.bmp"
 #define HUD_NUM_OF_PICTURES     4
 
 #define CAMERA_OUT_FB_SIZE     ( 640 * 480 * 2 )
@@ -335,13 +335,73 @@ static void processImage( CAMERA_DEVICE* pBuffDev, FB_DEVICE* pFbDev, unsigned i
   pSrcBuff = pBuffDev->buffers[ BuffIdx ].start;
   pDstBuff = pFbDev->Buff + pFbDev->vInfo.yoffset * pFbDev->fInfo.line_length;
 
-
-
-  memcpy( pDstBuff, pSrcBuff, pBuffDev->buffers[ BuffIdx ].length );
-
-
-
   fprintf( stderr, "Frame 0x%08X --> 0x%08X.\n", (unsigned int)pSrcBuff, (unsigned int)pDstBuff );
+  if( pBuffDev->PixelFormat == V4L2_PIX_FMT_RGB24 )
+  {
+    int x, y, location;
+    unsigned char red, green, blue;
+
+    for( y = 0; y < 240; y++ )
+      for( x = 0; x < 640; x++ )
+      {
+        red   = (*(unsigned char*)(pSrcBuff + ( y * 2 * 640 * 3 ) + ( x * 3 ))) >> 3;
+        green = (*(unsigned char*)(pSrcBuff + ( y * 2 * 640 * 3 ) + ( x * 3 ) + 1)) >> 2;
+        blue  = (*(unsigned char*)(pSrcBuff + ( y * 2 * 640 * 3 ) + ( x * 3 ) + 2)) >> 3;
+
+
+        location = x * ( pFbDev->vInfo.bits_per_pixel/8 ) + 
+                   y * pFbDev->fInfo.line_length;
+
+        pDstBuff[ location + 0] = ( ( green & 0x7 ) << 5 ) | ( blue ); 
+        pDstBuff[ location + 1] = ( red << 3 ) | ( green >> 3 ); 
+      }
+  }
+  else
+  if( pBuffDev->PixelFormat == V4L2_PIX_FMT_NV12 )
+  {
+    int x, y, location, colorPos; 
+    unsigned char Y;
+    signed int    U, V;
+    unsigned char red, green, blue;
+    unsigned char *pColor;
+
+    for( y = 0; y < 240; y++ )
+      for( x = 0; x < 640; x++ )
+      {
+        Y = pSrcBuff[ 2 * y * 640 + x];
+        if( ( x % 2 ) == 0 )
+        {
+          pColor = pSrcBuff + 640 * 480;
+          colorPos = y * 640 + x;
+          U = pColor[ colorPos ];
+          V = pColor[ colorPos + 1 ];
+        }
+
+        if( y >= 0 && y <= 10 )
+        {
+          red   = 0;
+          green = 0;
+          blue  = 0;
+        }
+        else
+        {
+          red = Y + 1.4075 * ( V - 128 );
+          green = Y - 0.3455 * ( U - 128 ) - ( 0.7169 * ( V - 128 ));
+          blue = Y + 1.7790 * ( U - 128 );
+        }
+
+        red   >>= 3;
+        green >>= 2;
+        blue  >>= 3;
+
+        location = x * ( pFbDev->vInfo.bits_per_pixel/8 ) + 
+                   y * pFbDev->fInfo.line_length;
+
+        pDstBuff[ location + 0] = ( ( green & 0x7 ) << 5 ) | ( blue ); 
+        pDstBuff[ location + 1] = ( red << 3 ) | ( green >> 3 ); 
+      }
+  }
+//  memcpy( pDstBuff, pSrcBuff, pBuffDev->buffers[ BuffIdx ].length );
 }
 
 //-------------------------------------------------------------------------- 
@@ -453,21 +513,11 @@ int main (int argc,char ** argv)
     goto exit;
   }
 
-//  if( startCamera( CAMERA_INT_DEVICE_NAME, V4L2_PIX_FMT_RGB24, &CamInt ) )
-//  {
-//    fprintf( stderr, "could start camera %s\n", CAMERA_EXT_DEVICE_NAME );
-//    goto exit;
-//  }
-
-
-/*
-  cam_out_fd = open( CAMERA_OUT_DEVICE_NAME, O_RDWR );
-  if( cam_out_fd < 0 ) 
+  if( startCamera( CAMERA_INT_DEVICE_NAME, V4L2_PIX_FMT_RGB24, &CamInt ) )
   {
-    fprintf( stderr, "could not open %s, %s\n", CAMERA_OUT_DEVICE_NAME, strerror( errno ) );
+    fprintf( stderr, "could not start camera %s\n", CAMERA_INT_DEVICE_NAME );
     goto exit;
   }
-*/
   
 
   iHudPicId = 0;
@@ -484,15 +534,23 @@ int main (int argc,char ** argv)
     FD_ZERO( &fds ); 
     FD_SET( input_fd, &fds ); 
     FD_SET( CamExt.fd, &fds ); 
+    FD_SET( CamInt.fd, &fds ); 
 
     tv.tv_sec  = 2; 
     tv.tv_usec = 0; 
 
-    r = select( CamExt.fd + 1, &fds, NULL, NULL, &tv ); 
+    r = select( CamInt.fd + 1, &fds, NULL, NULL, &tv ); 
 
     if( FD_ISSET( CamExt.fd, &fds) )
     {
-      readFrame( &CamExt, &CamOutFb, bIntCamActive );
+      fprintf( stderr, "Ext cam (%d).\n", r );
+      readFrame( &CamExt, &CamOutFb, !bIntCamActive );
+    }
+
+    if( FD_ISSET( CamInt.fd, &fds) )
+    {
+      fprintf( stderr, "Int cam (%d).\n", r );
+      readFrame( &CamInt, &CamOutFb, bIntCamActive );
     }
 
     if( FD_ISSET( input_fd, &fds) )
