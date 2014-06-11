@@ -2,9 +2,7 @@
 * vidservice.c: Daemon that receives commands input devices and makes
 *               camera devices produce pictures into frame buffers.
 *
-* No. | Date        | Author       | Description
-* ============================================================================
-* 1   | 6 Jun 2014 | Ivan Zaitsev | First release.
+* Authors: Ivan Zaitsev
 *
 ******************************************************************************/
 /*
@@ -31,6 +29,7 @@
 #include <fcntl.h>  
 #include <unistd.h> 
 #include <errno.h> 
+#include <stdbool.h>
 #include <linux/input.h>
 #include <sys/stat.h> 
 #include <sys/types.h> 
@@ -52,12 +51,32 @@
 #define HUD_PICTURE_FILE_NAME   "/boot/hud/screen_1.bmp"
 #define HUD_NUM_OF_PICTURES     4
 
+#define CAMERA_OUT_FB_SIZE     ( 640 * 480 * 2 )
+
+#define CLEAR(x) memset (&(x), 0, sizeof (x))
+
 //--------------------------------------------------------------------------
-int     input_fd,
-        cam_ext_fd, 
-        cam_int_fd,
-        cam_out_fd,
-        video_out_fd;
+typedef struct
+{ 
+    void * start; 
+    size_t length; 
+}BUFFER; 
+
+typedef struct
+{
+  int             fd;
+  unsigned int    PixelFormat;
+  unsigned int    NumOfBuffers;
+  BUFFER         *buffers;
+}CAMERA_DEVICE;
+
+typedef struct
+{
+  int             fd;
+  unsigned int    PixelFormat;
+  unsigned int    BuffSize;
+  unsigned char  *buff;
+}FB_DEVICE;
 
 //--------------------------------------------------------------------------
 static int xioctl( int fd,int request,void * arg ) 
@@ -71,14 +90,7 @@ static int xioctl( int fd,int request,void * arg )
 } 
 
 //--------------------------------------------------------------------------
-static void errno_exit( const char * s ) 
-{ 
-  fprintf( stderr, "%s error %d, %s\n",s, errno, strerror( errno ) ); 
-  exit( EXIT_FAILURE ); 
-}
-
-//--------------------------------------------------------------------------
-static void update_hud( char *sHudDevName, int iScrId ) 
+static void updateHud( char *sHudDevName, int iScrId ) 
 { 
   int                         hud_fd, 
                               pic_fd,
@@ -151,39 +163,217 @@ hud_exit:
 }
 
 //-------------------------------------------------------------------------- 
+static int initMmap( CAMERA_DEVICE* pBuffDev )
+{
+  struct v4l2_requestbuffers req; 
+
+  CLEAR (req); 
+  req.count   = 4; 
+  req.type    = V4L2_BUF_TYPE_VIDEO_CAPTURE; 
+  req.memory  = V4L2_MEMORY_MMAP; 
+
+  if( -1 == xioctl( pBuffDev->fd, VIDIOC_REQBUFS, &req ) ) 
+  { 
+    fprintf (stderr, "Error: does not support memory mapping.\n" ); 
+    return 1;
+  } 
+
+  if( req.count < 4 ) 
+  { 
+    fprintf (stderr, "Error: Insufficient buffer memory.\n" ); 
+    return 1;
+  } 
+
+  pBuffDev->buffers = calloc( req.count, sizeof( BUFFER ) ); 
+  if( !pBuffDev->buffers ) 
+  { 
+    fprintf( stderr, "Error: Out of memory.\n" ); 
+    return 1;
+  } 
+
+  for( pBuffDev->NumOfBuffers = 0; pBuffDev->NumOfBuffers < req.count; ++pBuffDev->NumOfBuffers ) 
+  { 
+    struct v4l2_buffer buf; 
+
+    CLEAR (buf); 
+
+    buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE; 
+    buf.memory = V4L2_MEMORY_MMAP; 
+    buf.index  = pBuffDev->NumOfBuffers; 
+
+    if( -1 == xioctl( pBuffDev->fd, VIDIOC_QUERYBUF, &buf ) ) 
+    {
+      fprintf( stderr, "Error: VIDIOC_QUERYBUF.\n" ); 
+      return 1;
+    }
+
+    pBuffDev->buffers[ pBuffDev->NumOfBuffers ].length = buf.length; 
+    pBuffDev->buffers[ pBuffDev->NumOfBuffers ].start  = mmap( NULL, buf.length, PROT_READ | PROT_WRITE ,MAP_SHARED, pBuffDev->fd, buf.m.offset ); 
+
+    if( MAP_FAILED == pBuffDev->buffers[ pBuffDev->NumOfBuffers ].start ) 
+    {
+      fprintf( stderr, "Error: mmap.\n" ); 
+      return 1;
+    }
+  }
+  return 0;
+}
+
+//-------------------------------------------------------------------------- 
+static int startStreaming( CAMERA_DEVICE* pBuffDev )
+{
+  unsigned int        i; 
+  enum v4l2_buf_type  type; 
+
+  for( i = 0; i < pBuffDev->NumOfBuffers; ++i ) 
+  { 
+    struct v4l2_buffer buf; 
+    CLEAR (buf); 
+
+    buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE; 
+    buf.memory = V4L2_MEMORY_MMAP; 
+    buf.index  = i; 
+
+    if( -1 == xioctl( pBuffDev->fd, VIDIOC_QBUF, &buf ) )
+    {
+      fprintf( stderr, "Error: VIDIOC_QBUF.\n" ); 
+      return 1;
+    }
+  } 
+
+  type = V4L2_BUF_TYPE_VIDEO_CAPTURE; 
+
+  if( -1 == xioctl( pBuffDev->fd, VIDIOC_STREAMON, &type ) ) 
+  {
+    fprintf( stderr, "Error: VIDIOC_STREAMON.\n" ); 
+    return 1;
+  }
+
+  return 0;
+}
+
+//-------------------------------------------------------------------------- 
+static int startCamera( char* sCamDevName, 
+                        unsigned int PixelFormat, 
+                        CAMERA_DEVICE* pBuffDev )
+{
+  int                 input;
+  struct v4l2_cropcap cropcap; 
+  struct v4l2_crop    crop; 
+  struct v4l2_format  fmt; 
+
+  pBuffDev->fd = open( sCamDevName, O_RDWR | O_NONBLOCK, 0 ); 
+  if( pBuffDev->fd < 0 ) 
+  { 
+    fprintf( stderr, "Cannot open '%s': %d, %s\n",sCamDevName, errno, strerror (errno) ); 
+    return 1; 
+  }
+
+  input = 1;
+  fprintf( stderr, "Select V4L2 input %d for device %s\n", input, sCamDevName );
+  if( ioctl( pBuffDev->fd, VIDIOC_S_INPUT, &input ) < 0 ) 
+  {
+    fprintf( stderr, "VIDIOC_S_INPUT error.\n" ); 
+    return 1; 
+  }
+
+  // Select video input, video standard and tune here.
+  CLEAR (cropcap); 
+  cropcap.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; 
+  if( 0 == xioctl( pBuffDev->fd, VIDIOC_CROPCAP, &cropcap ) ) 
+  { 
+    crop.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; 
+    crop.c    = cropcap.defrect;
+    xioctl( pBuffDev->fd, VIDIOC_S_CROP, &crop );
+  }
+
+  CLEAR( fmt ); 
+  fmt.type                = V4L2_BUF_TYPE_VIDEO_CAPTURE; 
+  fmt.fmt.pix.width       = 640;  
+  fmt.fmt.pix.height      = 480; 
+  fmt.fmt.pix.pixelformat = PixelFormat;
+  fmt.fmt.pix.field       = V4L2_FIELD_NONE; 
+  pBuffDev->PixelFormat   = PixelFormat;
+
+  if( -1 == xioctl( pBuffDev->fd, VIDIOC_S_FMT, &fmt ) ) 
+  {
+    fprintf( stderr, "VIDIOC_S_FMT error.\n" ); 
+    return 1;
+  }
+
+  fprintf(stderr, "%dx%d, %c%c%c%c, %d\n", 
+          fmt.fmt.pix.width, 
+          fmt.fmt.pix.height, 
+          (   fmt.fmt.pix.pixelformat & 0xFF ), 
+          ( ( fmt.fmt.pix.pixelformat >> 8 ) & 0xFF ), 
+          ( ( fmt.fmt.pix.pixelformat >> 16 ) & 0xFF ), 
+          ( ( fmt.fmt.pix.pixelformat >> 24 ) & 0xFF ),
+          fmt.fmt.pix.field );
+
+  if( initMmap( pBuffDev ) )
+    return 1;
+
+  if( startStreaming( pBuffDev ) )
+    return 1;
+
+  return 0;
+}
+
+//--------------------------------------------------------------------------
+static void processImage( CAMERA_DEVICE* pBuffDev, unsigned int BuffIdx )
+{
+  fprintf( stderr, ".\n" );
+}
+
+//-------------------------------------------------------------------------- 
+static void readFrame( CAMERA_DEVICE* pBuffDev, bool bCamActive ) 
+{
+  struct v4l2_buffer buf; 
+  unsigned int       i; 
+
+  CLEAR (buf); 
+  buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE; 
+  buf.memory = V4L2_MEMORY_MMAP; 
+
+  if( -1 == xioctl( pBuffDev->fd, VIDIOC_DQBUF, &buf ) ) 
+  { 
+    switch (errno) 
+    { 
+      case EAGAIN: 
+        return; 
+    
+      case EIO:
+      default: 
+        fprintf( stderr, "Error: VIDIOC_DQBUF.\n"); 
+    } 
+  } 
+
+  assert( buf.index < pBuffDev->NumOfBuffers );
+  assert( buf.field ==V4L2_FIELD_ANY );
+  if( bCamActive ) 
+    processImage( pBuffDev, buf.index ); 
+  if( -1 == xioctl( pBuffDev->fd, VIDIOC_QBUF, &buf ) ) 
+    fprintf( stderr, "Error: VIDIOC_QBUF.\n"); 
+}
  
 //-------------------------------------------------------------------------- 
 int main (int argc,char ** argv) 
 { 
+  CAMERA_DEVICE       CamInt,
+                      CamExt;
+  int                 input_fd,
+                      cam_out_fd,
+                      video_out_fd;
   int                 res,
                       iHudPicId;
   struct input_event  event;
+  bool                bExit,
+                      bIntCamActive;
 
-  input_fd = open( INPUT_DEVICE_NAME, O_RDWR );
+  input_fd = open( INPUT_DEVICE_NAME, O_RDWR | O_NONBLOCK );
   if( input_fd < 0 ) 
   {
     fprintf( stderr, "could not open %s, %s\n", INPUT_DEVICE_NAME, strerror( errno ) );
-    goto exit;
-  }
-
-  cam_ext_fd = open( CAMERA_EXT_DEVICE_NAME, O_RDWR | O_NONBLOCK );
-  if( cam_ext_fd < 0 ) 
-  {
-    fprintf( stderr, "could not open %s, %s\n", CAMERA_EXT_DEVICE_NAME, strerror( errno ) );
-    goto exit;
-  }
-
-  cam_int_fd = open( CAMERA_EXT_DEVICE_NAME, O_RDWR | O_NONBLOCK );
-  if( cam_int_fd < 0 ) 
-  {
-    fprintf( stderr, "could not open %s, %s\n", CAMERA_EXT_DEVICE_NAME, strerror( errno ) );
-    goto exit;
-  }
-
-  cam_out_fd = open( CAMERA_OUT_DEVICE_NAME, O_RDWR );
-  if( cam_out_fd < 0 ) 
-  {
-    fprintf( stderr, "could not open %s, %s\n", CAMERA_OUT_DEVICE_NAME, strerror( errno ) );
     goto exit;
   }
 
@@ -194,72 +384,95 @@ int main (int argc,char ** argv)
     goto exit;
   }
 
+  if( startCamera( CAMERA_EXT_DEVICE_NAME, V4L2_PIX_FMT_NV12, &CamExt ) )
+  {
+    fprintf( stderr, "could start camera %s\n", CAMERA_EXT_DEVICE_NAME );
+    goto exit;
+  }
+
+//  if( startCamera( CAMERA_INT_DEVICE_NAME, V4L2_PIX_FMT_RGB24, &CamInt ) )
+//  {
+//    fprintf( stderr, "could start camera %s\n", CAMERA_EXT_DEVICE_NAME );
+//    goto exit;
+//  }
+
+
+/*
+  cam_out_fd = open( CAMERA_OUT_DEVICE_NAME, O_RDWR );
+  if( cam_out_fd < 0 ) 
+  {
+    fprintf( stderr, "could not open %s, %s\n", CAMERA_OUT_DEVICE_NAME, strerror( errno ) );
+    goto exit;
+  }
+*/
+  
+
   iHudPicId = 0;
   write( video_out_fd, "0", 1 );
-  update_hud( HUD_OUT_DEVICE_NAME, iHudPicId );
+//  updateHud( HUD_OUT_DEVICE_NAME, iHudPicId );
 
-  for(;;)
+  bIntCamActive = true;
+  bExit         = false;
+  while( !bExit )
   { 
     fd_set fds; 
     struct timeval tv; 
     int r; 
     FD_ZERO( &fds ); 
     FD_SET( input_fd, &fds ); 
+    FD_SET( CamExt.fd, &fds ); 
 
     tv.tv_sec  = 2; 
     tv.tv_usec = 0; 
 
-    r = select( input_fd + 1, &fds, NULL, NULL, &tv ); 
+    r = select( CamExt.fd + 1, &fds, NULL, NULL, &tv ); 
 
-    if( -1 == r ) 
-    { 
-      if( EINTR == errno ) 
-        continue; 
-      errno_exit( "select" ); 
-    }  
-
-    fprintf( stderr, "EVENT: " );
-    res = read( input_fd, &event, sizeof( event ) );
-    if( res == sizeof( event ) ) 
+    if( FD_ISSET( CamExt.fd, &fds) )
     {
-       fprintf( stderr, "type %08X, code %08X, value %08X\n", event.type, event.code, event.value );
-       if( event.value )
-       {
-          switch( event.code )
-          {
-            case KEY_F1:
-              write( video_out_fd, "0", 1 );
-              break;
-
-            case KEY_F2:
-              write( video_out_fd, "1", 1 );
-              break;
-
-            case KEY_F3:
-              write( video_out_fd, "1", 1 );
-              break;
-
-            case KEY_F4:
-              iHudPicId = ( iHudPicId + 1 ) % HUD_NUM_OF_PICTURES;
-              update_hud( HUD_OUT_DEVICE_NAME, iHudPicId );
-              break;
-
-          }
-       }
+      readFrame( &CamExt, bIntCamActive );
     }
-    else
+
+    if( FD_ISSET( input_fd, &fds) )
     {
-      fprintf( stderr, "read error %s\n", strerror( errno ) );
+      fprintf( stderr, "EVENT (%d): ", r );
+      res = read( input_fd, &event, sizeof( event ) );
+      if( res == sizeof( event ) ) 
+      {
+         fprintf( stderr, "type %08X, code %08X, value %08X\n", event.type, event.code, event.value );
+         if( event.value )
+         {
+            switch( event.code )
+            {
+              case KEY_F1:
+                write( video_out_fd, "0", 1 );
+                break;
+
+              case KEY_F2:
+                bIntCamActive = true;
+                write( video_out_fd, "1", 1 );
+                break;
+
+              case KEY_F3:
+                bIntCamActive = false;
+                write( video_out_fd, "1", 1 );
+                break;
+
+              case KEY_F4:
+                iHudPicId = ( iHudPicId + 1 ) % HUD_NUM_OF_PICTURES;
+                updateHud( HUD_OUT_DEVICE_NAME, iHudPicId );
+                break;
+
+              case KEY_C:
+                bExit = true;
+                break;
+            }
+         }
+      }
     }
   } 
 
 
 exit:
-  close( input_fd );
-  close( cam_ext_fd );
-  close( cam_int_fd );
-  close( cam_out_fd );
-  close( video_out_fd );
   return 0; 
 } 
 
