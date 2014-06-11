@@ -44,7 +44,7 @@
 #define INPUT_DEVICE_NAME       "/dev/input/event1"
 #define CAMERA_EXT_DEVICE_NAME  "/dev/video0"
 #define CAMERA_INT_DEVICE_NAME  "/dev/video1"
-#define CAMERA_OUT_DEVICE_NAME  "/dev/graphics/fb2"
+#define CAMERA_OUT_DEVICE_NAME  "/dev/graphics/fb0"
 #define VIDEO_OUT_SWITCH_NAME   "/sys/class/video_output/LCD/state"
 
 #define HUD_OUT_DEVICE_NAME     "/dev/graphics/fb4"
@@ -72,10 +72,11 @@ typedef struct
 
 typedef struct
 {
-  int             fd;
-  unsigned int    PixelFormat;
-  unsigned int    BuffSize;
-  unsigned char  *buff;
+  int                       fd;
+  struct fb_var_screeninfo  vInfo;
+  struct fb_fix_screeninfo  fInfo;
+  unsigned int              BuffSize;
+  unsigned char            *Buff;
 }FB_DEVICE;
 
 //--------------------------------------------------------------------------
@@ -320,13 +321,31 @@ static int startCamera( char* sCamDevName,
 }
 
 //--------------------------------------------------------------------------
-static void processImage( CAMERA_DEVICE* pBuffDev, unsigned int BuffIdx )
+static void processImage( CAMERA_DEVICE* pBuffDev, FB_DEVICE* pFbDev, unsigned int BuffIdx )
 {
-  fprintf( stderr, ".\n" );
+  unsigned char *pSrcBuff,
+                *pDstBuff;
+
+  if( -1 == xioctl( pFbDev->fd, FBIOGET_VSCREENINFO, &pFbDev->vInfo ) ) 
+  { 
+    fprintf( stderr, "Error: reading variable information.\n"); 
+    return; 
+  }
+
+  pSrcBuff = pBuffDev->buffers[ BuffIdx ].start;
+  pDstBuff = pFbDev->Buff + pFbDev->vInfo.yoffset * pFbDev->fInfo.line_length;
+
+
+
+  memcpy( pDstBuff, pSrcBuff, pBuffDev->buffers[ BuffIdx ].length );
+
+
+
+  fprintf( stderr, "Frame 0x%08X --> 0x%08X.\n", (unsigned int)pSrcBuff, (unsigned int)pDstBuff );
 }
 
 //-------------------------------------------------------------------------- 
-static void readFrame( CAMERA_DEVICE* pBuffDev, bool bCamActive ) 
+static void readFrame( CAMERA_DEVICE* pBuffDev, FB_DEVICE* pFbDev, bool bCamActive ) 
 {
   struct v4l2_buffer buf; 
   unsigned int       i; 
@@ -351,9 +370,47 @@ static void readFrame( CAMERA_DEVICE* pBuffDev, bool bCamActive )
   assert( buf.index < pBuffDev->NumOfBuffers );
   assert( buf.field ==V4L2_FIELD_ANY );
   if( bCamActive ) 
-    processImage( pBuffDev, buf.index ); 
+    processImage( pBuffDev, pFbDev, buf.index ); 
   if( -1 == xioctl( pBuffDev->fd, VIDIOC_QBUF, &buf ) ) 
     fprintf( stderr, "Error: VIDIOC_QBUF.\n"); 
+}
+
+//-------------------------------------------------------------------------- 
+static int initFb( char* sFbDevName, 
+                   FB_DEVICE* pFbDev )
+{
+  // Open frame buffer device. 
+  pFbDev->fd = open( sFbDevName, O_RDWR );
+  if( pFbDev->fd < 0 ) 
+  {
+    fprintf( stderr, "Error: could not open %s, %s\n", sFbDevName, strerror( errno ) );
+    return 1;
+  }
+
+  // Get fixed screen information. 
+  if( -1 == xioctl( pFbDev->fd, FBIOGET_FSCREENINFO, &pFbDev->fInfo ) ) 
+  { 
+    fprintf( stderr, "Error: reading fixed information.\n" ); 
+    return 1;
+  }
+
+  // Get variable screen information. 
+  if( -1 == xioctl( pFbDev->fd, FBIOGET_VSCREENINFO, &pFbDev->vInfo ) ) 
+  { 
+    fprintf( stderr, "Error: reading variable information.\n" ); 
+    return 1; 
+  } 
+  pFbDev->BuffSize = pFbDev->vInfo.xres_virtual * pFbDev->vInfo.yres_virtual * pFbDev->vInfo.bits_per_pixel / 8;
+
+  // Map frame buffer device to memory.
+  pFbDev->Buff = ( unsigned char * )mmap( NULL, pFbDev->BuffSize, PROT_READ | PROT_WRITE, MAP_SHARED , pFbDev->fd, 0 ); 
+  if( (int)pFbDev->Buff == -1 ) 
+  { 
+    fprintf( stderr, "Error: failed to map framebuffer device to memory.\n" ); 
+    return 1;
+  }
+
+  return 0;
 }
  
 //-------------------------------------------------------------------------- 
@@ -361,8 +418,8 @@ int main (int argc,char ** argv)
 { 
   CAMERA_DEVICE       CamInt,
                       CamExt;
+  FB_DEVICE           CamOutFb;
   int                 input_fd,
-                      cam_out_fd,
                       video_out_fd;
   int                 res,
                       iHudPicId;
@@ -384,9 +441,15 @@ int main (int argc,char ** argv)
     goto exit;
   }
 
+  if( initFb( CAMERA_OUT_DEVICE_NAME, &CamOutFb ) )
+  {
+    fprintf( stderr, "could not init frame buffer %s\n", CAMERA_OUT_DEVICE_NAME );
+    goto exit;
+  }
+
   if( startCamera( CAMERA_EXT_DEVICE_NAME, V4L2_PIX_FMT_NV12, &CamExt ) )
   {
-    fprintf( stderr, "could start camera %s\n", CAMERA_EXT_DEVICE_NAME );
+    fprintf( stderr, "could not start camera %s\n", CAMERA_EXT_DEVICE_NAME );
     goto exit;
   }
 
@@ -409,7 +472,7 @@ int main (int argc,char ** argv)
 
   iHudPicId = 0;
   write( video_out_fd, "0", 1 );
-//  updateHud( HUD_OUT_DEVICE_NAME, iHudPicId );
+  updateHud( HUD_OUT_DEVICE_NAME, iHudPicId );
 
   bIntCamActive = true;
   bExit         = false;
@@ -429,7 +492,7 @@ int main (int argc,char ** argv)
 
     if( FD_ISSET( CamExt.fd, &fds) )
     {
-      readFrame( &CamExt, bIntCamActive );
+      readFrame( &CamExt, &CamOutFb, bIntCamActive );
     }
 
     if( FD_ISSET( input_fd, &fds) )
