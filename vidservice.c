@@ -46,6 +46,8 @@
 #define CAMERA_EXT_DEVICE_NAME  "/dev/video0"
 #define CAMERA_INT_DEVICE_NAME  "/dev/video1"
 #define CAMERA_OUT_DEVICE_NAME  "/dev/graphics/fb2"
+#define VIDEO_OUT_SWITCH_NAME   "/sys/class/video_output/LCD/state"
+
 #define HUD_OUT_DEVICE_NAME     "/dev/graphics/fb4"
 #define HUD_PICTURE_FILE_NAME   "/boot/hud/screen_1.bmp"
 #define HUD_NUM_OF_PICTURES     4
@@ -54,7 +56,8 @@
 int     input_fd,
         cam_ext_fd, 
         cam_int_fd,
-        cam_out_fd;
+        cam_out_fd,
+        video_out_fd;
 
 //--------------------------------------------------------------------------
 static int xioctl( int fd,int request,void * arg ) 
@@ -146,6 +149,8 @@ hud_exit:
   close( hud_fd );
   close( pic_fd );
 }
+
+//-------------------------------------------------------------------------- 
  
 //-------------------------------------------------------------------------- 
 int main (int argc,char ** argv) 
@@ -182,7 +187,15 @@ int main (int argc,char ** argv)
     goto exit;
   }
 
+  video_out_fd = open( VIDEO_OUT_SWITCH_NAME, O_RDWR );
+  if( video_out_fd < 0 ) 
+  {
+    fprintf( stderr, "could not open %s, %s\n", VIDEO_OUT_SWITCH_NAME, strerror( errno ) );
+    goto exit;
+  }
+
   iHudPicId = 0;
+  write( video_out_fd, "0", 1 );
   update_hud( HUD_OUT_DEVICE_NAME, iHudPicId );
 
   for(;;)
@@ -215,6 +228,18 @@ int main (int argc,char ** argv)
           switch( event.code )
           {
             case KEY_F1:
+              write( video_out_fd, "0", 1 );
+              break;
+
+            case KEY_F2:
+              write( video_out_fd, "1", 1 );
+              break;
+
+            case KEY_F3:
+              write( video_out_fd, "1", 1 );
+              break;
+
+            case KEY_F4:
               iHudPicId = ( iHudPicId + 1 ) % HUD_NUM_OF_PICTURES;
               update_hud( HUD_OUT_DEVICE_NAME, iHudPicId );
               break;
@@ -234,6 +259,7 @@ exit:
   close( cam_ext_fd );
   close( cam_int_fd );
   close( cam_out_fd );
+  close( video_out_fd );
   return 0; 
 } 
 
