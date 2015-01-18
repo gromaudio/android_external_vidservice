@@ -49,7 +49,7 @@
 
 #define HUD_OUT_DEVICE_NAME     "/dev/graphics/fb4"
 #define HUD_PICTURE_FILE_NAME   "/boot/hud/screen_x.bmp"
-#define HUD_NUM_OF_PICTURES     4
+#define HUD_NUM_OF_PICTURES     7
 
 #define CAMERA_OUT_FB_SIZE     ( 640 * 480 * 2 )
 
@@ -135,6 +135,14 @@ static void updateHud( char *sHudDevName, int iScrId )
   } 
   hudScrSize = vHudInfo.xres_virtual * vHudInfo.yres_virtual * vHudInfo.bits_per_pixel / 8;
 
+  fprintf( stderr, "Visible res:    %dx%d\n", vHudInfo.xres, vHudInfo.yres );
+  fprintf( stderr, "Virtual res:    %dx%d\n", vHudInfo.xres_virtual, vHudInfo.yres_virtual );
+  fprintf( stderr, "Offset  res:    %dx%d\n", vHudInfo.xoffset, vHudInfo.yoffset );
+  fprintf( stderr, "Bits per pixel: %d\n", vHudInfo.bits_per_pixel );
+  fprintf( stderr, "Red:   %d(%d)\n", vHudInfo.red.offset, vHudInfo.red.length );
+  fprintf( stderr, "Green: %d(%d)\n", vHudInfo.green.offset, vHudInfo.green.length );
+  fprintf( stderr, "Blue:  %d(%d)\n", vHudInfo.blue.offset, vHudInfo.blue.length );
+  fprintf( stderr, "Alpha: %d(%d)\n", vHudInfo.transp.offset, vHudInfo.transp.length );
 
   // Map frame buffer device to memory.
   pHudFb = ( unsigned char * )mmap( NULL, hudScrSize, PROT_READ | PROT_WRITE, MAP_SHARED , hud_fd, 0 ); 
@@ -543,13 +551,13 @@ int main (int argc,char ** argv)
 
     if( FD_ISSET( CamExt.fd, &fds) )
     {
-      fprintf( stderr, "Ext cam (%d).\n", r );
+//      fprintf( stderr, "Ext cam (%d).\n", r );
       readFrame( &CamExt, &CamOutFb, !bIntCamActive );
     }
 
     if( FD_ISSET( CamInt.fd, &fds) )
     {
-      fprintf( stderr, "Int cam (%d).\n", r );
+//      fprintf( stderr, "Int cam (%d).\n", r );
       readFrame( &CamInt, &CamOutFb, bIntCamActive );
     }
 
